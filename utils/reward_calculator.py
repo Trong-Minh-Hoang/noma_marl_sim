@@ -1,4 +1,8 @@
 # utils/reward_calculator.py
+"""
+Blended reward function for two-phase training.
+Matches: Section III.D (convergence mechanisms)
+"""
 
 def get_blended_reward(
     episode: int, 
@@ -8,28 +12,78 @@ def get_blended_reward(
     smooth_end: int = 32000
 ) -> float:
     """
-    Blend rewards between Phase 1 (throughput) and Phase 2 (fairness) 
-    during smooth transition window.
-    
-    Matches: Section IV, Figure 1 caption, and Algorithm 1 (Phase Transition block).
+    Smooth transition between Phase 1 (sum-rate) and Phase 2 (fairness).
     
     Args:
-        episode: Current training episode
-        reward_phase1: Reward from throughput objective (Eq. 13)
-        reward_phase2: Reward from fairness objective (Eq. 14)
-        smooth_start: Start of blending window (default: 28,000)
-        smooth_end: End of blending window (default: 32,000)
+        episode: Current episode number
+        reward_phase1: Sum-rate reward (Phase 1 objective)
+        reward_phase2: Fairness reward (Phase 2 objective)
+        smooth_start: Episode to start blending (default: 28000)
+        smooth_end: Episode to complete transition (default: 32000)
     
     Returns:
-        Blended reward r_t = (1 - α) * r1 + α * r2
+        Blended reward value
     """
     if episode < smooth_start:
-        # Pure Phase 1
+        # Phase 1: Pure sum-rate maximization
         return reward_phase1
-    elif episode >= smooth_end:
-        # Pure Phase 2
+    
+    elif episode > smooth_end:
+        # Phase 2: Pure fairness optimization
         return reward_phase2
+    
     else:
-        # Linear interpolation: α from 0 → 1
+        # Smooth transition: Linear interpolation
         alpha = (episode - smooth_start) / (smooth_end - smooth_start)
-        return (1.0 - alpha) * reward_phase1 + alpha * reward_phase2
+        blended = (1 - alpha) * reward_phase1 + alpha * reward_phase2
+        return blended
+
+
+def get_phase(episode: int, smooth_start: int = 28000) -> int:
+    """
+    Determine current training phase.
+    
+    Args:
+        episode: Current episode number
+        smooth_start: Episode to start Phase 2
+    
+    Returns:
+        1 for Phase 1, 2 for Phase 2
+    """
+    return 1 if episode < smooth_start else 2
+
+
+def get_learning_rate(
+    episode: int,
+    phase: int,
+    lr_base: float,
+    smooth_start: int = 28000,
+    smooth_end: int = 32000
+) -> float:
+    """
+    Compute learning rate with phase-dependent scheduling.
+    
+    Phase 1: Cosine annealing from lr_base to 0.1*lr_base over 30000 episodes
+    Phase 2: Constant lr_base (reduced by factor in train.py)
+    
+    Args:
+        episode: Current episode
+        phase: Training phase (1 or 2)
+        lr_base: Base learning rate
+        smooth_start: Phase 2 start episode
+        smooth_end: Phase 2 end episode
+    
+    Returns:
+        Learning rate for current episode
+    """
+    import numpy as np
+    
+    if phase == 1:
+        # Cosine annealing: lr(t) = 0.5 * lr_base * (1 + cos(π*t/30000))
+        progress = min(episode / 30000.0, 1.0)
+        lr = lr_base * 0.5 * (1 + np.cos(np.pi * progress))
+        return max(lr, 0.1 * lr_base)  # Floor at 0.1*lr_base
+    
+    else:  # phase == 2
+        # Constant learning rate (already reduced in train.py)
+        return lr_base
