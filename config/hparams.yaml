@@ -1,1 +1,42 @@
+# config/hparams.yaml
+# Matches: Section III.D (convergence mechanisms) + Section IV (training setup)
 
+# RL Core
+gamma: 0.9995            # Discount factor (Section III.B, POMDP)
+
+# Network Architecture (Section IV)
+hidden_dims: [256, 256, 128, 128]  # Dueling DQN layers
+dropout: 0.2             # Dropout rate
+
+# Training Dynamics
+batch_size: 128          # ↑ from 64 → "batch size 128 (increased from 64 for variance reduction)"
+replay_buffer_size: 100000  # "large replay buffer (capacity = 100,000 transitions)"
+grad_max_norm: 10.0      # "gradient clipping with norm ≤ 10"
+
+# Learning Rates (Section IV)
+lr_phase1: 0.001         # 1e-3
+lr_phase2: 0.0001        # 1e-4 = 0.1 * lr_phase1
+
+# Exploration (Section III.D, Mechanism 3)
+epsilon_start: 1.0
+epsilon_end: 0.01
+epsilon_decay_episodes: 30000  # "ε decays from 1.0 to 0.01 over 30,000 episodes"
+
+# Target Network (Section III.D, Mechanism 2)
+tau: 0.005               # Polyak averaging coefficient
+
+# PER (Section III.D, Mechanism 1)
+alpha: 0.6               # Priority exponent: p_i = (|δ_i| + ε)^α
+beta: 0.4                # Initial IS weight exponent
+beta_increment: 0.00001  # Gradually increase β → 1.0
+
+# Reward Design (Section III.A, Eq. 13–14)
+lambda_I: 0.1            # Interference penalty weight
+lambda_Q: 2.0            # QoS violation penalty weight
+lambda_var: 0.5          # Rate variance penalty (Phase 2)
+
+# Training Schedule
+total_episodes: 50000
+phase1_episodes: 30000
+smooth_transition_start: 28000
+smooth_transition_end: 32000

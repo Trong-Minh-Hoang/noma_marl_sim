@@ -1,1 +1,19 @@
+# config/system.yaml
+# Matches: Section IV, "System parameters: P_max = 10 dBm, P_total = 15 dBm, ..."
 
+# Wireless System Parameters (from Table I + Section IV)
+P_max_dBm: 10.0          # Maximum transmit power per user (dBm)
+P_total_dBm: 15.0        # Total power budget per BS (dBm)
+R_min_bpsHz: 0.5         # Minimum QoS data rate (bps/Hz)
+I_th_dBm: -50.0          # Interference protection threshold (dBm)
+B_Hz: 1000000.0          # System bandwidth = 1 MHz
+sigma2_dBm: -100.0       # Noise power (dBm)
+
+# Channel Model (Stretched Path Loss, Section II)
+alpha_L: 0.01            # Attenuation coefficient
+beta_L: 1.0              # Path loss exponent
+
+# Network Topology
+num_cells: 7             # 7-cell hexagonal UDN
+cell_radius_m: 50.0      # Cell radius (50 m)
+d0_m: 10.0               # Cooperation distance threshold (m) → optimal value from Fig. 3
