@@ -3,40 +3,41 @@
 
 # RL Core
 gamma: 0.9995            # Discount factor (Section III.B, POMDP)
+tau: 0.005               # Polyak averaging coefficient (soft update)
 
 # Network Architecture (Section IV)
 hidden_dims: [256, 256, 128, 128]  # Dueling DQN layers
 dropout: 0.2             # Dropout rate
 
 # Training Dynamics
-batch_size: 128          # ↑ from 64 → "batch size 128 (increased from 64 for variance reduction)"
-replay_buffer_size: 100000  # "large replay buffer (capacity = 100,000 transitions)"
-grad_max_norm: 10.0      # "gradient clipping with norm ≤ 10"
+batch_size: 128          # Mini-batch size
+replay_buffer_size: 100000  # Experience replay buffer capacity
 
-# Learning Rates (Section IV)
-lr_phase1: 0.001         # 1e-3
-lr_phase2: 0.0001        # 1e-4 = 0.1 * lr_phase1
+# Learning Rate Scheduling
+lr_phase1: 1.0e-3        # Phase 1: Sum-rate maximization
+lr_phase2: 1.0e-4        # Phase 2: Fairness optimization (reduced)
 
-# Exploration (Section III.D, Mechanism 3)
-epsilon_start: 1.0
-epsilon_end: 0.01
-epsilon_decay_episodes: 30000  # "ε decays from 1.0 to 0.01 over 30,000 episodes"
+# Exploration Schedule (ε-greedy)
+epsilon_start: 1.0       # Initial exploration rate
+epsilon_end: 0.01        # Final exploration rate
+epsilon_decay: 30000     # Episodes for linear decay
 
-# Target Network (Section III.D, Mechanism 2)
-tau: 0.005               # Polyak averaging coefficient
+# Two-Phase Training
+smooth_start: 28000      # Episode to start Phase 2 transition
+smooth_end: 32000        # Episode to complete Phase 2 transition
 
-# PER (Section III.D, Mechanism 1)
-alpha: 0.6               # Priority exponent: p_i = (|δ_i| + ε)^α
-beta: 0.4                # Initial IS weight exponent
-beta_increment: 0.00001  # Gradually increase β → 1.0
-
-# Reward Design (Section III.A, Eq. 13–14)
+# Reward Function Weights (Eq. 15-16)
 lambda_I: 0.1            # Interference penalty weight
-lambda_Q: 2.0            # QoS violation penalty weight
-lambda_var: 0.5          # Rate variance penalty (Phase 2)
+lambda_Q: 2.0            # QoS penalty weight (Phase 1)
+lambda_var: 0.5          # Variance penalty weight (Phase 2)
 
-# Training Schedule
-total_episodes: 50000
-phase1_episodes: 30000
-smooth_transition_start: 28000
-smooth_transition_end: 32000
+# Prioritized Experience Replay
+alpha_per: 0.6           # Priority exponent (0=uniform, 1=full priority)
+beta_per: 0.4            # Importance sampling exponent (0=no correction, 1=full)
+beta_increment: 0.001    # Beta annealing rate
+
+# Training Setup
+max_episodes: 40000      # Total training episodes
+steps_per_episode: 100   # Fixed episode length
+update_frequency: 1      # Training steps per environment step
+target_update_freq: 1    # Target network update frequency
