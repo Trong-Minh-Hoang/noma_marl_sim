@@ -56,6 +56,7 @@ class DuelingDQN(nn.Module):
         q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
         return q_values
 
+
 class D3QNAgent:
     """
     Independent Q-Learning (IQL) agent with Dueling Double DQN (D3QN-IQL).
@@ -67,138 +68,189 @@ class D3QNAgent:
                  agent_id: int,
                  lr: float = 1e-3,
                  gamma: float = 0.9995,
-                 tau: float = 0.005,        # Polyak averaging (Section III.D)
+                 tau: float = 0.005,
                  buffer_size: int = 100000,
-                 batch_size: int = 128,     # Updated from 64 → 128
-                 grad_max_norm: float = 10.0,
+                 batch_size: int = 128,
                  epsilon_start: float = 1.0,
                  epsilon_end: float = 0.01,
-                 epsilon_decay_episodes: int = 30000):
+                 epsilon_decay: int = 30000,
+                 device: str = 'cpu'):
+        """
+        Initialize D3QN-IQL agent.
         
-        self.agent_id = agent_id
+        Args:
+            state_dim: Observation dimension
+            action_dim: Action space size
+            agent_id: Agent identifier
+            lr: Initial learning rate
+            gamma: Discount factor
+            tau: Soft update coefficient (Polyak averaging)
+            buffer_size: Replay buffer capacity
+            batch_size: Training batch size
+            epsilon_start: Initial exploration rate
+            epsilon_end: Final exploration rate
+            epsilon_decay: Episodes for epsilon decay
+            device: 'cpu' or 'cuda'
+        """
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.agent_id = agent_id
         self.gamma = gamma
         self.tau = tau
         self.batch_size = batch_size
-        self.grad_max_norm = grad_max_norm
-        self.epsilon_decay_episodes = epsilon_decay_episodes
+        self.device = device
         
-        # Networks
-        self.q_net = DuelingDQN(state_dim, action_dim)
-        self.target_q_net = DuelingDQN(state_dim, action_dim)
-        self.target_q_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
-        
-        # Prioritized Replay Buffer (Section III.D, Mechanism 1)
-        self.replay_buffer = PrioritizedReplayBuffer(buffer_size, alpha=0.6)
-        
-        # Epsilon decay (Section III.D, Mechanism 3)
-        self.epsilon = epsilon_start
+        # Exploration schedule
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.epsilon = epsilon_start
         
-        # Tracking for Figure 2
-        self.entropy_history = []
-        self.td_error_history = []
-        self.episode_rewards = []
+        # Q-networks
+        self.q_net = DuelingDQN(state_dim, action_dim).to(device)
+        self.target_q_net = DuelingDQN(state_dim, action_dim).to(device)
+        self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.target_q_net.eval()
         
-        # Device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.q_net.to(self.device)
-        self.target_q_net.to(self.device)
+        # Optimizer
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.lr = lr
+        
+        # Replay buffer (Prioritized Experience Replay)
+        self.replay_buffer = PrioritizedReplayBuffer(buffer_size)
+        
+        # Training statistics
+        self.train_steps = 0
+        self.episode_count = 0
     
     def select_action(self, state: np.ndarray, training: bool = True) -> int:
-        """ε-greedy action selection (Algorithm 1, line 13–16)."""
-        if training and random.random() < self.epsilon:
-            return random.randrange(self.action_dim)
+        """
+        Select action using ε-greedy policy.
         
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        Args:
+            state: Current state (observation)
+            training: If True, use exploration; if False, use greedy
+        
+        Returns:
+            Action index
+        """
+        if training and np.random.rand() < self.epsilon:
+            # Exploration: random action
+            return np.random.randint(self.action_dim)
+        
+        # Exploitation: greedy action
         with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.q_net(state_tensor)
+            action = q_values.argmax(dim=1).item()
         
-        # Track policy entropy for Figure 2 (Mechanism: softmax over Q)
-        temperature = 1.0  # Can be tuned
-        probs = F.softmax(q_values / temperature, dim=1)
-        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1).mean().item()
-        self.entropy_history.append(entropy)
-        
-        return q_values.max(1)[1].item()
+        return action
     
-    def store_transition(self, 
-                        state: np.ndarray, 
-                        action: int, 
-                        reward: float, 
-                        next_state: np.ndarray, 
-                        done: bool):
-        """Store experience in prioritized buffer."""
-        self.replay_buffer.add(state, action, reward, next_state, done)
-        self.episode_rewards.append(reward)
-    
-    def compute_reward_variance(self, window: int = 100) -> float:
-        """Track reward variance every 100 episodes (Figure 2 requirement)."""
-        if len(self.episode_rewards) < window:
-            return np.var(self.episode_rewards) if self.episode_rewards else 0.0
-        return np.var(self.episode_rewards[-window:])
+    def store_transition(self, state: np.ndarray, action: int, reward: float,
+                        next_state: np.ndarray, done: bool):
+        """Store transition in replay buffer."""
+        transition = Transition(state, action, reward, next_state, done)
+        self.replay_buffer.add(transition)
     
     def update_epsilon(self, episode: int):
-        """Linear decay (Section III.D, Mechanism 3)."""
-        decay_rate = (self.epsilon_start - self.epsilon_end) / self.epsilon_decay_episodes
+        """
+        Update exploration rate with linear decay.
+        ε(t) = max(ε_end, ε_start - (ε_start - ε_end) * t / ε_decay)
+        """
+        decay_rate = (self.epsilon_start - self.epsilon_end) / self.epsilon_decay
         self.epsilon = max(self.epsilon_end, self.epsilon_start - decay_rate * episode)
     
-    def train(self) -> Tuple[float, float]:
-        """Train one step (Algorithm 1, line 28–36)."""
+    def update_target_network(self):
+        """
+        Soft update target network using Polyak averaging (Eq. 3.3).
+        θ_target ← τ * θ + (1-τ) * θ_target
+        """
+        for param, target_param in zip(self.q_net.parameters(), 
+                                       self.target_q_net.parameters()):
+            target_param.data.copy_(
+                self.tau * param.data + (1 - self.tau) * target_param.data
+            )
+    
+    def train_step(self) -> float:
+        """
+        Perform one training step using prioritized experience replay.
+        
+        Returns:
+            TD loss value
+        """
         if len(self.replay_buffer) < self.batch_size:
-            return 0.0, 0.0
+            return 0.0
         
         # Sample batch with priorities
-        batch, indices, weights = self.replay_buffer.sample(self.batch_size)
+        transitions, indices, weights = self.replay_buffer.sample(self.batch_size)
+        
+        # Unpack transitions
+        states = torch.FloatTensor(np.array([t.state for t in transitions])).to(self.device)
+        actions = torch.LongTensor(np.array([t.action for t in transitions])).to(self.device)
+        rewards = torch.FloatTensor(np.array([t.reward for t in transitions])).to(self.device)
+        next_states = torch.FloatTensor(np.array([t.next_state for t in transitions])).to(self.device)
+        dones = torch.FloatTensor(np.array([t.done for t in transitions])).to(self.device)
         weights = torch.FloatTensor(weights).to(self.device)
         
-        state_batch = torch.FloatTensor(np.array([b.state for b in batch])).to(self.device)
-        action_batch = torch.LongTensor([b.action for b in batch]).to(self.device)
-        reward_batch = torch.FloatTensor([b.reward for b in batch]).to(self.device)
-        next_state_batch = torch.FloatTensor(np.array([b.next_state for b in batch])).to(self.device)
-        done_batch = torch.BoolTensor([b.done for b in batch]).to(self.device)
+        # Current Q-values
+        q_values = self.q_net(states)
+        q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
         
-        # Current Q values
-        current_q_values = self.q_net(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze(1)
-        
-        # Double DQN target: use main net to select, target net to evaluate
+        # Double DQN: use online network to select action, target network to evaluate
         with torch.no_grad():
-            next_actions = self.q_net(next_state_batch).max(1)[1]
-            next_q_values = self.target_q_net(next_state_batch).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            target_q_values = reward_batch + (self.gamma * next_q_values * (~done_batch))
+            next_q_values_online = self.q_net(next_states)
+            next_actions = next_q_values_online.argmax(dim=1)
+            
+            next_q_values_target = self.target_q_net(next_states)
+            next_q_values = next_q_values_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            
+            # Bellman target
+            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
         
-        # TD Error (for tracking and priority update)
-        td_errors = target_q_values - current_q_values
-        td_error_abs = torch.abs(td_errors)
-        mean_td_error = td_error_abs.mean().item()
-        self.td_error_history.append(mean_td_error)
+        # TD loss with importance sampling weights
+        td_error = q_values - target_q_values
+        weighted_loss = (weights * td_error.pow(2)).mean()
         
-        # Huber loss (smooth L1) with importance sampling weights
-        loss = (weights * F.smooth_l1_loss(current_q_values, target_q_values, reduction='none')).mean()
-        
-        # Optimize
+        # Backward pass
         self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.grad_max_norm)  # Gradient clipping
+        weighted_loss.backward()
+        
+        # Gradient clipping (norm ≤ 10)
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
+        
         self.optimizer.step()
         
-        # Update priorities
-        self.replay_buffer.update_priorities(indices, td_error_abs.detach().cpu().numpy() + 1e-5)
+        # Update priorities in replay buffer
+        priorities = np.abs(td_error.detach().cpu().numpy()) + 1e-6
+        self.replay_buffer.update_priorities(indices, priorities)
         
-        return loss.item(), mean_td_error
+        self.train_steps += 1
+        
+        return weighted_loss.item()
     
-    def update_target_network(self):
-        """Polyak averaging (Section III.D, Mechanism 2)."""
-        for target_param, param in zip(self.target_q_net.parameters(), self.q_net.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+    def set_learning_rate(self, lr: float):
+        """Update learning rate."""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
     
-    def get_metrics(self) -> Dict[str, float]:
-        """Return metrics for Figure 2."""
-        return {
-            'policy_entropy': np.mean(self.entropy_history[-100:]) if self.entropy_history else 0.0,
-            'td_error': np.mean(self.td_error_history[-100:]) if self.td_error_history else 0.0,
-            'reward_variance': self.compute_reward_variance()
+    def save_checkpoint(self, path: str):
+        """Save agent checkpoint."""
+        checkpoint = {
+            'q_net': self.q_net.state_dict(),
+            'target_q_net': self.target_q_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'train_steps': self.train_steps,
+            'episode_count': self.episode_count
         }
+        torch.save(checkpoint, path)
+    
+    def load_checkpoint(self, path: str):
+        """Load agent checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.q_net.load_state_dict(checkpoint['q_net'])
+        self.target_q_net.load_state_dict(checkpoint['target_q_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.epsilon = checkpoint['epsilon']
+        self.train_steps = checkpoint['train_steps']
+        self.episode_count = checkpoint['episode_count']
