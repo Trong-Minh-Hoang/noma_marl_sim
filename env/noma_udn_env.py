@@ -40,11 +40,22 @@ class NOMA_UDN_Env:
                 if 0 < Pc < Pe <= self.P_max and (Pc + Pe) <= self.P_total:
                     self.action_space.append((Pc, Pe))
         self.num_actions = len(self.action_space)  # ≈ 300 as in paper
-
+        
+        # Random projection matrices for observation (Eq. 20)
+        # QR decomposition ensures orthonormal basis
+        self.Phi_pos = np.linalg.qr(np.random.randn(3, 3))[0]
+        self.Phi_ch = np.linalg.qr(np.random.randn(3, 3))[0]
+        
+        # State tracking
+        self.user_positions = {}
+        self.channel_gains = {}
+        self.current_powers = {}  # Track last action
+        
     def reset(self) -> Dict[int, np.ndarray]:
         """Initialize user positions and channels (start of episode)."""
         self.user_positions = {}  # {cell_id: [(x1,y1), (x2,y2)]}
         self.channel_gains = {}   # {cell_id: [g1, g2, g12]}
+        self.current_powers = {}  # {cell_id: (Pc, Pe)}
         
         for j in range(self.num_cells):
             # Random user positions within hex cell (simplified: circular radius 50m)
@@ -60,187 +71,313 @@ class NOMA_UDN_Env:
             g2 = np.random.exponential(1)
             g12 = np.random.exponential(1)
             self.channel_gains[j] = [g1, g2, g12]
+            
+            # Initialize powers
+            self.current_powers[j] = (self.power_levels[5], self.power_levels[10])
         
         return self._get_observations()
     
+    def _get_path_loss(self, distance: float) -> float:
+        """
+        Stretched Path Loss model (Section II).
+        L(d) = exp(-α_L * d^β_L)
+        """
+        return np.exp(-self.alpha_L * (distance ** self.beta_L))
+    
     def _get_observations(self) -> Dict[int, np.ndarray]:
-        """Local observation per BS (Section III.B: POMDP formulation)."""
+        """
+        Compute observation for each cell (Eq. 20).
+        Φ_pos ∈ R^(3×3), Φ_ch ∈ R^(3×3) are random projection matrices.
+        Observation: [Φ_pos @ d_vector; Φ_ch @ g_vector] ∈ R^6
+        """
         obs = {}
+        
         for j in range(self.num_cells):
-            pos = self.user_positions[j]
-            d1 = np.linalg.norm(pos[0])  # Distance near user to BS
-            d2 = np.linalg.norm(pos[1])  # Distance far user to BS
-            d12 = np.linalg.norm(np.array(pos[0]) - np.array(pos[1]))  # Inter-user dist
+            # Extract distances
+            x1, y1 = self.user_positions[j][0]  # Near user
+            x2, y2 = self.user_positions[j][1]  # Far user
             
-            g1, g2, g12 = self.channel_gains[j]
+            d1 = np.sqrt(x1**2 + y1**2)  # Distance near user to BS
+            d2 = np.sqrt(x2**2 + y2**2)  # Distance far user to BS
+            d12 = np.sqrt((x2-x1)**2 + (y2-y1)**2)  # Inter-user distance
             
-            # Observation vector (8D as in paper: d_s=8)
-            obs[j] = np.array([
-                d1, d2, d12,      # 3 distances
-                g1, g2, g12,      # 3 channel gains
-                0.0, 0.0          # Placeholder for P_c, P_e (will be updated after action)
-            ], dtype=np.float32)
+            # Distance vector
+            d_vec = np.array([d1, d2, d12], dtype=np.float32)
+            
+            # Channel gain vector
+            g_vec = np.array(self.channel_gains[j], dtype=np.float32)
+            
+            # Apply random projections (Eq. 20)
+            obs_pos = self.Phi_pos @ d_vec
+            obs_ch = self.Phi_ch @ g_vec
+            
+            # Concatenate: [Φ_pos @ d; Φ_ch @ g] ∈ R^6
+            obs[j] = np.concatenate([obs_pos, obs_ch]).astype(np.float32)
+        
         return obs
-
-    def step(self, actions: Dict[int, int]) -> Tuple[Dict, Dict, Dict, Dict]:
+    
+    def _compute_sinrs(self, powers: Dict[int, Tuple[float, float]]) -> Dict[int, Tuple[float, float]]:
         """
-        Execute joint actions, compute rewards, SINR, and next state.
-        Matches: Eq.(1)-(6), Eq.(8)-(11), and reward definitions (Eq.13-14).
+        Compute SINR for both users in each cell (Eq. 6).
+        
+        Args:
+            powers: {cell_id: (Pc, Pe)} power allocation
+        
+        Returns:
+            {cell_id: (SINR1, SINR2)} SINRs
         """
-        rewards = {}
-        infos = {}
+        sinrs = {}
         
-        # Store chosen powers
-        powers = {}
-        for j, action_idx in actions.items():
-            Pc, Pe = self.action_space[action_idx]
-            powers[j] = (Pc, Pe)
-        
-        # Precompute all signal powers and interference
-        S1 = {}  # Near user signal
-        S2 = {}  # Far user combined signal
-        I_total = {}  # Total interference per user
-        I_caused = {}  # Interference caused by BS j
-        
-        for j in range(self.num_cells):
-            d12 = np.linalg.norm(
-                np.array(self.user_positions[j][0]) - np.array(self.user_positions[j][1])
-            )
-            g1, g2, g12 = self.channel_gains[j]
-            Pc, Pe = powers[j]
+        for i in range(self.num_cells):
+            Pc_i, Pe_i = powers[i]
+            x1_i, y1_i = self.user_positions[i][0]
+            x2_i, y2_i = self.user_positions[i][1]
+            d1_i = np.sqrt(x1_i**2 + y1_i**2)
+            d2_i = np.sqrt(x2_i**2 + y2_i**2)
+            d12_i = np.sqrt((x2_i-x1_i)**2 + (y2_i-y1_i)**2)
             
-            # Path losses (Stretched Path Loss model: L = exp(-α d^β))
-            L1 = np.exp(-self.alpha_L * (np.linalg.norm(self.user_positions[j][0]))**self.beta_L)
-            L2 = np.exp(-self.alpha_L * (np.linalg.norm(self.user_positions[j][1]))**self.beta_L)
-            L12 = np.exp(-self.alpha_L * d12**self.beta_L)
+            g1_i, g2_i, g12_i = self.channel_gains[i]
+            L1_i = self._get_path_loss(d1_i)
+            L2_i = self._get_path_loss(d2_i)
+            L12_i = self._get_path_loss(d12_i)
             
-            # Signal powers (Eq. 1, 3)
-            S1[j] = Pc * g1 * L1
-            coop_gain = Pe * g1 * g12 * L12 * L1 if d12 < self.d0 else 0.0
-            S2[j] = Pe * g2 * L2 + coop_gain
+            # Desired signal power (Eq. 1-3)
+            P1_desired = Pc_i * g1_i * L1_i
+            P2_direct = Pe_i * g2_i * L2_i
+            P2_relay = Pe_i * g1_i * g12_i * L12_i * L1_i * (1 if d12_i < self.d0 else 0)
+            P2_desired = P2_direct + P2_relay
             
-            # Total interference caused by BS j (for C4)
-            I_caused[j] = 0.0
-        
-        # Compute interference at each BS (Eq. 4, 5)
-        for i in range(self.num_cells):  # Target BS
-            I_direct = 0.0
-            I_relay = 0.0
-            for j in range(self.num_cells):  # Interfering BS
-                if i == j:
+            # Interference from other cells
+            I1_total = self.sigma2
+            I2_total = self.sigma2
+            I_relay = 0  # Relay interference
+            
+            for j in range(self.num_cells):
+                if j == i:
                     continue
-                # Distance from interferers to target BS i
-                # Simplified: assume fixed inter-BS distance = 100m (2 * cell radius)
-                d_to_i = 100.0
-                L1_to_i = np.exp(-self.alpha_L * d_to_i**self.beta_L)
-                L2_to_i = L1_to_i
                 
                 Pc_j, Pe_j = powers[j]
-                g1_to_i = np.random.exponential(1)  # New fading to BS i
-                g2_to_i = np.random.exponential(1)
+                x1_j, y1_j = self.user_positions[j][0]
+                x2_j, y2_j = self.user_positions[j][1]
+                d1_ij = np.sqrt((x1_j - x1_i)**2 + (y1_j - y1_i)**2)
+                d2_ij = np.sqrt((x2_j - x1_i)**2 + (y2_j - y1_i)**2)
+                d12_ij = np.sqrt((x2_j - x1_j)**2 + (y2_j - y1_j)**2)
                 
-                # Direct interference (Eq. 4)
-                I_direct += Pc_j * g1_to_i * L1_to_i + Pe_j * g2_to_i * L2_to_i
+                g1_ij = np.random.exponential(1)  # New fading realization
+                g2_ij = np.random.exponential(1)
+                g12_ij = np.random.exponential(1)
+                
+                L1_ij = self._get_path_loss(d1_ij)
+                L2_ij = self._get_path_loss(d2_ij)
+                L12_ij = self._get_path_loss(d12_ij)
+                
+                # Interference to near user (Eq. 4)
+                I1_total += Pc_j * g1_ij * L1_ij + Pe_j * g2_ij * L2_ij
+                
+                # Interference to far user (Eq. 4)
+                I2_total += Pc_j * g1_ij * L1_ij + Pe_j * g2_ij * L2_ij
                 
                 # Relay interference (Eq. 5)
-                d12_j = np.linalg.norm(
-                    np.array(self.user_positions[j][0]) - np.array(self.user_positions[j][1])
-                )
-                if d12_j < self.d0:
-                    g12_to_i = np.random.exponential(1)
-                    L12_to_i = np.exp(-self.alpha_L * d12_j**self.beta_L)
-                    I_relay += Pe_j * g1_to_i * g12_to_i * L12_to_i * L1_to_i
+                if d12_ij < self.d0:
+                    I_relay += Pe_j * g1_ij * g12_ij * L12_ij * L1_ij
             
-            I_total[i] = I_direct + I_relay
+            I2_total += I_relay
             
-            # Accumulate I_caused for each BS j
-            for j in range(self.num_cells):
-                if i != j:
-                    # Same as above but from j's perspective
-                    d_to_j = 100.0
-                    L1_to_j = np.exp(-self.alpha_L * d_to_j**self.beta_L)
-                    L2_to_j = L1_to_j
-                    Pc_j, Pe_j = powers[j]
-                    g1_to_j = np.random.exponential(1)
-                    g2_to_j = np.random.exponential(1)
-                    I_dir = Pc_j * g1_to_j * L1_to_j + Pe_j * g2_to_j * L2_to_j
-                    
-                    d12_j = np.linalg.norm(
-                        np.array(self.user_positions[j][0]) - np.array(self.user_positions[j][1])
-                    )
-                    I_rel = 0.0
-                    if d12_j < self.d0:
-                        g12_to_j = np.random.exponential(1)
-                        L12_to_j = np.exp(-self.alpha_L * d12_j**self.beta_L)
-                        I_rel = Pe_j * g1_to_j * g12_to_j * L12_to_j * L1_to_j
-                    I_caused[j] += I_dir + I_rel
+            # SINR (Eq. 6)
+            sinr1 = P1_desired / I1_total if I1_total > 0 else 0
+            sinr2 = P2_desired / I2_total if I2_total > 0 else 0
+            
+            sinrs[i] = (sinr1, sinr2)
         
-        # Compute SINR and rates (Eq. 6, 7)
+        return sinrs
+    
+    def _compute_rates(self, sinrs: Dict[int, Tuple[float, float]]) -> Dict[int, Tuple[float, float]]:
+        """
+        Compute throughput rates from SINRs.
+        R = B * log2(1 + SINR)
+        """
         rates = {}
-        sinrs = {}
-        for j in range(self.num_cells):
-            total_interference = I_total[j]
-            sinr1 = S1[j] / (total_interference + self.sigma2)
-            sinr2 = S2[j] / (total_interference + self.sigma2)
-            sinrs[j] = (sinr1, sinr2)
-            
-            R1 = self.B * np.log2(1 + sinr1)
-            R2 = self.B * np.log2(1 + sinr2)
-            rates[j] = (R1, R2)
+        for i in range(self.num_cells):
+            sinr1, sinr2 = sinrs[i]
+            r1 = self.B * np.log2(1 + sinr1)
+            r2 = self.B * np.log2(1 + sinr2)
+            rates[i] = (r1, r2)
+        return rates
+    
+    def _compute_interference_caused(self, powers: Dict[int, Tuple[float, float]]) -> Dict[int, float]:
+        """
+        Compute interference caused by each cell to neighbors (Eq. 12, C4).
+        I_caused[j] = sum over neighbors of interference from cell j
+        """
+        I_caused = {j: 0.0 for j in range(self.num_cells)}
         
-        # Return observations, rewards, etc.
-        next_obs = self._get_next_observations(powers)
+        for i in range(self.num_cells):
+            Pc_i, Pe_i = powers[i]
+            x1_i, y1_i = self.user_positions[i][0]
+            x2_i, y2_i = self.user_positions[i][1]
+            d12_i = np.sqrt((x2_i-x1_i)**2 + (y2_i-y1_i)**2)
+            
+            for j in range(self.num_cells):
+                if j == i:
+                    continue
+                
+                x1_j, y1_j = self.user_positions[j][0]
+                x2_j, y2_j = self.user_positions[j][1]
+                
+                d1_ij = np.sqrt((x1_i - x1_j)**2 + (y1_i - y1_j)**2)
+                d2_ij = np.sqrt((x2_i - x2_j)**2 + (y2_i - y2_j)**2)
+                d12_ij = np.sqrt((x2_i - x1_i)**2 + (y2_i - y1_i)**2)
+                
+                g1_ij = np.random.exponential(1)
+                g2_ij = np.random.exponential(1)
+                g12_ij = np.random.exponential(1)
+                
+                L1_ij = self._get_path_loss(d1_ij)
+                L2_ij = self._get_path_loss(d2_ij)
+                L12_ij = self._get_path_loss(d12_ij)
+                
+                # Direct interference
+                I_direct = Pc_i * g1_ij * L1_ij + Pe_i * g2_ij * L2_ij
+                
+                # Relay interference
+                I_relay = Pe_i * g1_ij * g12_ij * L12_ij * L1_ij * (1 if d12_i < self.d0 else 0)
+                
+                I_caused[i] += I_direct + I_relay
         
-        return next_obs, rewards, rates, I_caused, sinrs  # Will compute rewards externally
-
-    def _get_next_observations(self, powers: Dict[int, Tuple[float, float]]) -> Dict[int, np.ndarray]:
-        """Update observation with current powers and new channels."""
-        next_obs = {}
+        return I_caused
+    
+    def _validate_constraints(self, powers: Dict[int, Tuple[float, float]]) -> bool:
+        """
+        Validate constraints C1-C5 (Eq. 9-13).
+        
+        Returns:
+            True if all constraints satisfied, False otherwise
+        """
         for j in range(self.num_cells):
-            # Update channel gains (Rayleigh fading per frame)
-            g1 = np.random.exponential(1)
-            g2 = np.random.exponential(1)
-            g12 = np.random.exponential(1)
-            self.channel_gains[j] = [g1, g2, g12]
-            
-            pos = self.user_positions[j]
-            d1 = np.linalg.norm(pos[0])
-            d2 = np.linalg.norm(pos[1])
-            d12 = np.linalg.norm(np.array(pos[0]) - np.array(pos[1]))
-            
             Pc, Pe = powers[j]
-            next_obs[j] = np.array([
-                d1, d2, d12,
-                g1, g2, g12,
-                Pc, Pe  # Now include actual chosen powers
-            ], dtype=np.float32)
-        return next_obs
-
-    def compute_reward(self, 
-                      rates: Dict[int, Tuple[float, float]], 
+            
+            # C1: 0 < Pc < Pe ≤ P_max
+            if not (0 < Pc < Pe <= self.P_max):
+                return False
+            
+            # C2: Pc + Pe ≤ P_total
+            if Pc + Pe > self.P_total:
+                return False
+        
+        return True
+    
+    def compute_reward(self,
+                      rates: Dict[int, Tuple[float, float]],
                       I_caused: Dict[int, float],
-                      phase: int,
+                      phase: int = 1,
                       lambda_I: float = 0.1,
                       lambda_Q: float = 2.0,
                       lambda_var: float = 0.5) -> Dict[int, float]:
         """
-        Compute phase-dependent rewards (Eq. 13, 14).
+        Compute reward for each cell based on phase (Eq. 15-16).
+        
+        Phase 1 (Eq. 15): Maximize sum-rate with interference penalty
+        Phase 2 (Eq. 16): Maximize Jain's Fairness Index
+        
+        Args:
+            rates: {cell_id: (R1, R2)} throughput rates
+            I_caused: {cell_id: I} interference caused to neighbors
+            phase: Training phase (1 or 2)
+            lambda_I: Interference penalty weight
+            lambda_Q: QoS penalty weight
+            lambda_var: Variance penalty weight (Phase 2)
+        
+        Returns:
+            {cell_id: reward} reward for each cell
         """
         rewards = {}
+        
         for j in range(self.num_cells):
             R1, R2 = rates[j]
             I_j = I_caused[j]
             
-            # QoS penalty
-            qos_penalty = max(0, self.R_min - R1) + max(0, self.R_min - R2)
+            if phase == 1:
+                # Eq. 15: Sum-rate maximization with QoS constraints
+                sum_rate = R1 + R2
+                
+                # QoS penalty: penalize if rates below minimum
+                qos_penalty = max(0, self.R_min - R1) + max(0, self.R_min - R2)
+                
+                # Reward = sum_rate - λ_I * I_caused - λ_Q * QoS_penalty
+                reward = sum_rate - lambda_I * I_j - lambda_Q * qos_penalty
             
-            if phase == 1:  # Throughput optimization
-                reward = (R1 + R2) - lambda_I * I_j - lambda_Q * qos_penalty
-            else:  # Phase 2: Fairness optimization
-                # Jain's Fairness Index (Eq. 12)
-                jfi = 0.5 * (R1 + R2)**2 / (R1**2 + R2**2 + 1e-10)
+            else:  # phase == 2
+                # Eq. 16: Fairness optimization (Jain's Fairness Index)
+                # JFI = (R1 + R2)^2 / (R1^2 + R2^2)
+                numerator = (R1 + R2) ** 2
+                denominator = R1**2 + R2**2 + 1e-10  # Avoid division by zero
+                jfi = numerator / denominator
+                
+                # Variance penalty: encourage equal rates
                 rate_var = np.var([R1, R2])
+                
+                # Reward = JFI - λ_I * I_caused - λ_var * variance
                 reward = jfi - lambda_I * I_j - lambda_var * rate_var
             
             rewards[j] = reward
+        
         return rewards
+    
+    def step(self, actions: Dict[int, int]) -> Tuple[Dict, bool, Dict, Dict, Dict]:
+        """
+        Execute one step in environment.
+        
+        Args:
+            actions: {cell_id: action_idx} power allocation actions
+        
+        Returns:
+            next_obs: Next observations for all cells
+            done: Episode termination flag
+            rates: Throughput rates {cell_id: (R1, R2)}
+            I_caused: Interference caused {cell_id: I}
+            info: Additional info dict
+        """
+        # Convert action indices to power pairs
+        powers = {}
+        for j in range(self.num_cells):
+            action_idx = actions[j]
+            powers[j] = self.action_space[action_idx]
+        
+        # Validate constraints
+        if not self._validate_constraints(powers):
+            # Fallback to safe action
+            for j in range(self.num_cells):
+                powers[j] = self.action_space[0]
+        
+        # Store current powers
+        self.current_powers = powers
+        
+        # Compute SINRs and rates
+        sinrs = self._compute_sinrs(powers)
+        rates = self._compute_rates(sinrs)
+        
+        # Compute interference caused
+        I_caused = self._compute_interference_caused(powers)
+        
+        # Update channel gains for next step (Rayleigh fading)
+        for j in range(self.num_cells):
+            self.channel_gains[j] = [
+                np.random.exponential(1),
+                np.random.exponential(1),
+                np.random.exponential(1)
+            ]
+        
+        # Get next observations
+        next_obs = self._get_observations()
+        
+        # Episode termination (fixed length episodes)
+        done = False
+        
+        # Info dict
+        info = {
+            'sinrs': sinrs,
+            'powers': powers,
+            'I_caused': I_caused
+        }
+        
+        return next_obs, done, rates, I_caused, info
